@@ -32,12 +32,14 @@ def load_data():
         sales_data = pd.read_excel('Продажи.xlsx', sheet_name=sheet_sales)
         price_data = pd.read_excel('Продажи.xlsx', sheet_name=sheet_prices)
         
+        # Отладка: Вывод столбцов листа 'Цены'
+        with st.expander("🔍 Отладка: Столбцы в листе 'Цены'"):
+            st.write("Столбцы:", price_data.columns.tolist())
+            st.write(price_data.head(3))  # Первые 3 строки для проверки
+        
         # Переименование и подготовка
         price_data.rename(columns={'Цена': 'Цена'}, inplace=True)
         price_data['Цена'] = pd.to_numeric(price_data['Цена'], errors='coerce')
-        if 'Наименование' in price_data.columns:
-            # Убедимся, что 'Наименование' сохранено
-            pass
         
         sales_data['Дата'] = pd.to_datetime(sales_data['Дата'], format="%d.%m.%Y")
         sales_data.set_index('Дата', inplace=True)
@@ -65,7 +67,8 @@ if merged_data is not None:
         # Выбор товара
         selected_item = st.selectbox("🛒 Выберите товар:", unique_items)
         
-        # Получение наименования товара
+        # Получение наименования товара (с отладкой)
+        product_name = None
         if 'Наименование' in price_data.columns:
             name_row = price_data[price_data['Номенклатура'] == selected_item]
             if not name_row.empty:
@@ -74,7 +77,17 @@ if merged_data is not None:
             else:
                 st.warning("Наименование не найдено для выбранного товара.")
         else:
-            st.warning("Столбец 'Наименование' не найден в листе 'Цены'.")
+            # Альтернатива: Если столбец называется иначе, подставьте здесь (например, 'Название')
+            possible_names = ['Название', 'Наименование товара', 'Product Name']
+            for col in possible_names:
+                if col in price_data.columns:
+                    name_row = price_data[price_data['Номенклатура'] == selected_item]
+                    if not name_row.empty:
+                        product_name = name_row[col].iloc[0]
+                        st.markdown(f"**📝 Наименование товара:** {product_name}")
+                        break
+            if product_name is None:
+                st.warning("Столбец 'Наименование' (или похожий) не найден в листе 'Цены'. Проверьте отладку выше.")
         
         # Фильтрация данных для товара
         item_data = merged_data[merged_data['Номенклатура'] == selected_item].dropna(subset=['Цена_x', 'Кол-во продано, шт.'])
