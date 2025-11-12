@@ -1,292 +1,218 @@
-import streamlit as st
+# -*- coding: utf-8 -*-
+"""
+Прогноз промо-продаж (LightGBM, глобальная модель)
+Файл: Продажи1.xlsx
+Листы: "Продажи" и "Цены"
+"""
 import pandas as pd
 import numpy as np
-from sklearn.linear_model import LinearRegression
-import plotly.express as px
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import LabelEncoder
+import lightgbm as lgb
+from datetime import timedelta
+from sklearn.metrics import mean_squared_error
 
-# Настройка страницы
-st.set_page_config(page_title="Прогноз Промо-Продаж", layout="wide", initial_sidebar_state="expanded")
+# ------------------ Параметры ------------------
+INPUT_FILE = r'Продажи1.xlsx'   # путь к вашему файлу
+SALES_SHEET = 'Продажи'
+PRICES_SHEET = 'Цены'
+N_FOLDS = 5
+FORECAST_DAYS = 30
+LAGS = [7, 14, 28]
+ROLL_WINDOWS = [7, 14, 28]
+RANDOM_STATE = 42
+# ------------------------------------------------
 
-# Кастом CSS для красоты
-st.markdown("""
-<style>
-.metric {background-color: #f0f2f6; padding: 10px; border-radius: 5px;}
-.stButton > button {background-color: #4ECDC4; color: white;}
-</style>
-""", unsafe_allow_html=True)
+# === 1. Загрузка ===
+sales = pd.read_excel(INPUT_FILE, sheet_name=SALES_SHEET)
+promo_prices = pd.read_excel(INPUT_FILE, sheet_name=PRICES_SHEET)
 
-st.title("🚀 Дашборд: Прогноз продаж на акции")
+# === 2. Очистка названий столбцов ===
+sales.columns = sales.columns.astype(str).str.strip()
+promo_prices.columns = promo_prices.columns.astype(str).str.strip()
 
-# Сайдбар для настроек
-st.sidebar.header("⚙️ Настройки")
-DAYS_ON_SALE = st.sidebar.slider("Дни акции:", min_value=1, max_value=30, value=5)
-sheet_sales = st.sidebar.selectbox("Лист продаж:", options=["Продажи"], index=0)  # Пока фиксировано
-sheet_prices = st.sidebar.selectbox("Лист цен:", options=["Цены"], index=0)  # Пока фиксировано
-if st.sidebar.button("🔄 Обновить данные"):
-    st.rerun()
+# Автоматическое переименование по ключевым словам
+rename_map_sales = {}
+for c in sales.columns:
+    cl = c.lower()
+    if 'дат' in cl:
+        rename_map_sales[c] = 'ds'
+    elif 'номенк' in cl:
+        rename_map_sales[c] = 'SKU'
+    elif 'кол' in cl:
+        rename_map_sales[c] = 'qty'
+    elif 'цен' in cl:
+        rename_map_sales[c] = 'price'
 
-# Кэшированная загрузка данных (теперь из файла в репозитории)
-@st.cache_data
-def load_data():
-    try:
-        sales_data = pd.read_excel('Продажи.xlsx', sheet_name=sheet_sales)
-        price_data = pd.read_excel('Продажи.xlsx', sheet_name=sheet_prices)
-        
-        # Отладка: Вывод столбцов листа 'Цены'
-        with st.expander("🔍 Отладка: Столбцы в листе 'Цены'"):
-            st.write("Столбцы:", price_data.columns.tolist())
-            st.write(price_data.head(3))  # Первые 3 строки для проверки
-        
-        # Переименование и подготовка
-        price_data.rename(columns={'Цена': 'Цена'}, inplace=True)
-        price_data['Цена'] = pd.to_numeric(price_data['Цена'], errors='coerce')
-        
-        sales_data['Дата'] = pd.to_datetime(sales_data['Дата'], format="%d.%m.%Y")
-        sales_data.set_index('Дата', inplace=True)
-        
-        # Объединение
-        merged_data = sales_data.merge(price_data, on='Номенклатура', how='left')
-        merged_data['Цена_x'] = pd.to_numeric(merged_data['Цена_x'], errors='coerce')
-        
-        return sales_data, price_data, merged_data
-    except Exception as e:
-        st.error(f"Ошибка загрузки файла 'Продажи.xlsx': {e}. Убедитесь, что файл в репозитории.")
-        return None, None, None
+sales = sales.rename(columns=rename_map_sales)
 
-# Автоматическая загрузка данных
-sales_data, price_data, merged_data = load_data()
+rename_map_promo = {}
+for c in promo_prices.columns:
+    cl = c.lower()
+    if 'номенк' in cl:
+        rename_map_promo[c] = 'SKU'
+    elif 'цен' in cl:
+        rename_map_promo[c] = 'promo_price'
+promo_prices = promo_prices.rename(columns=rename_map_promo)
 
-if merged_data is not None:
-    # Список уникальных товаров (конвертируем в list для selectbox)
-    unique_items_array = merged_data['Номенклатура'].dropna().unique()
-    unique_items = list(unique_items_array)
-    
-    if len(unique_items) == 0:
-        st.warning("Нет данных о товарах. Проверьте файл.")
-    else:
-        # Выбор товара
-        selected_item = st.selectbox("🛒 Выберите товар:", unique_items)
-        
-        # Получение наименования товара (с отладкой)
-        product_name = None
-        if 'Наименование' in price_data.columns:
-            name_row = price_data[price_data['Номенклатура'] == selected_item]
-            if not name_row.empty:
-                product_name = name_row['Наименование'].iloc[0]
-                st.markdown(f"**📝 Наименование товара:** {product_name}")
-            else:
-                st.warning("Наименование не найдено для выбранного товара.")
+# Проверка обязательных колонок
+required_sales_cols = {'ds', 'SKU', 'qty', 'price'}
+if not required_sales_cols.issubset(sales.columns):
+    raise ValueError(f"Не найдены нужные колонки в листе 'Продажи': {sales.columns.tolist()}")
+
+required_price_cols = {'SKU', 'promo_price'}
+if not required_price_cols.issubset(promo_prices.columns):
+    raise ValueError(f"Не найдены нужные колонки в листе 'Цены': {promo_prices.columns.tolist()}")
+
+# === 3. Приведение типов ===
+sales['ds'] = pd.to_datetime(sales['ds'])
+sales['SKU'] = sales['SKU'].astype(str)
+promo_prices['SKU'] = promo_prices['SKU'].astype(str)
+
+# === 4. Агрегация ===
+sales = sales.groupby(['ds', 'SKU'], as_index=False).agg({'qty':'sum','price':'mean'})
+
+# === 5. Заполнение пропусков по датам ===
+skus = sales['SKU'].unique()
+min_date = sales['ds'].min()
+max_date = sales['ds'].max()
+
+all_dates = pd.date_range(min_date, max_date)
+df_full = pd.MultiIndex.from_product([skus, all_dates], names=['SKU', 'ds']).to_frame(index=False)
+df = df_full.merge(sales, on=['SKU','ds'], how='left')
+df = df.sort_values(['SKU','ds'])
+df['qty'] = df['qty'].fillna(0)
+df['price'] = df.groupby('SKU')['price'].ffill().bfill()
+df['price'] = df['price'].fillna(df['price'].mean())
+
+# === 6. Временные признаки ===
+df['dow'] = df['ds'].dt.weekday
+df['month'] = df['ds'].dt.month
+df['day'] = df['ds'].dt.day
+df['is_weekend'] = df['dow'].isin([5,6]).astype(int)
+
+# === 7. Лаги и скользящие средние ===
+for lag in LAGS:
+    df[f'lag_{lag}'] = df.groupby('SKU')['qty'].shift(lag).fillna(0)
+
+for w in ROLL_WINDOWS:
+    df[f'roll_mean_{w}'] = (
+        df.groupby('SKU')['qty']
+        .shift(1)
+        .rolling(window=w, min_periods=1)
+        .mean()
+        .reset_index(level=0, drop=True)
+        .fillna(0)
+    )
+
+# Относительная цена
+mean_price_per_sku = df.groupby('SKU')['price'].transform('mean')
+df['price_rel'] = df['price'] / (mean_price_per_sku + 1e-9)
+
+# Кодирование SKU
+le = LabelEncoder()
+df['SKU_le'] = le.fit_transform(df['SKU'])
+
+FEATURES = ['price','price_rel','dow','month','day','is_weekend','SKU_le'] + \
+           [f'lag_{l}' for l in LAGS] + [f'roll_mean_{w}' for w in ROLL_WINDOWS]
+TARGET = 'qty'
+
+# === 8. Обучение модели ===
+X = df[FEATURES]
+y = df[TARGET]
+
+kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+models = []
+oof_preds = np.zeros(len(df))
+
+for fold, (train_idx, val_idx) in enumerate(kf.split(X), 1):
+    X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
+    y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
+
+    train_data = lgb.Dataset(X_tr, label=y_tr)
+    val_data = lgb.Dataset(X_val, label=y_val)
+
+    params = {
+        'objective':'regression',
+        'metric':'rmse',
+        'verbosity': -1,
+        'seed': RANDOM_STATE + fold,
+        'learning_rate': 0.05,
+        'num_leaves': 64,
+        'feature_fraction': 0.8,
+        'bagging_fraction': 0.8,
+        'bagging_freq': 5
+    }
+
+    # --- Исправленная часть ---
+    model = lgb.train(
+        params,
+        train_data,
+        valid_sets=[val_data],
+        num_boost_round=2000,
+        callbacks=[
+            lgb.early_stopping(100),
+            lgb.log_evaluation(100)  # каждые 100 итераций вывод
+        ]
+    )
+
+    models.append(model)
+    oof_preds[val_idx] = model.predict(X_val, num_iteration=model.best_iteration)
+
+rmse = mean_squared_error(y, oof_preds, squared=False)
+print(f'OOF RMSE: {rmse:.4f}')
+
+# === 9. Прогноз на новые цены ===
+forecast_start = max_date + timedelta(days=1)
+forecast_dates = pd.date_range(forecast_start, forecast_start + timedelta(days=FORECAST_DAYS-1))
+
+rows = []
+for _, promo_row in promo_prices.iterrows():
+    sku = promo_row['SKU']
+    promo_price = promo_row['promo_price']
+    last = df[df['SKU'] == sku].sort_values('ds').iloc[-1] if sku in df['SKU'].values else None
+
+    for ds in forecast_dates:
+        if last is not None:
+            base = last.copy()
+            entry = {
+                'ds': ds,
+                'SKU': sku,
+                'price': promo_price,
+                'price_rel': promo_price / (base['price'] + 1e-9),
+                'dow': ds.weekday(),
+                'month': ds.month,
+                'day': ds.day,
+                'is_weekend': int(ds.weekday() in [5,6]),
+                'SKU_le': le.transform([sku])[0] if sku in le.classes_ else int(np.median(le.transform(le.classes_)))
+            }
+            for l in LAGS:
+                entry[f'lag_{l}'] = base.get(f'lag_{l}', 0)
+            for w in ROLL_WINDOWS:
+                entry[f'roll_mean_{w}'] = base.get(f'roll_mean_{w}', 0)
         else:
-            # Альтернатива: Если столбец называется иначе, подставьте здесь (например, 'Название')
-            possible_names = ['Название', 'Наименование товара', 'Product Name']
-            for col in possible_names:
-                if col in price_data.columns:
-                    name_row = price_data[price_data['Номенклатура'] == selected_item]
-                    if not name_row.empty:
-                        product_name = name_row[col].iloc[0]
-                        st.markdown(f"**📝 Наименование товара:** {product_name}")
-                        break
-            if product_name is None:
-                st.warning("Столбец 'Наименование' (или похожий) не найден в листе 'Цены'. Проверьте отладку выше.")
-        
-        # Фильтрация данных для товара
-        item_data = merged_data[merged_data['Номенклатура'] == selected_item].dropna(subset=['Цена_x', 'Кол-во продано, шт.'])
-        
-        if len(item_data) < 30:
-            st.warning(f"Недостаточно данных для товара {selected_item} (нужно ≥30 записей).")
-        else:
-            # Прогресс-бар
-            progress_bar = st.progress(0)
-            
-            # Подготовка X и y
-            X = item_data[['Цена_x']].values
-            y = item_data['Кол-во продано, шт.'].values
-            
-            # Обучение модели
-            model = LinearRegression()
-            model.fit(X, y)
-            progress_bar.progress(50)
-            
-            # Диагностика
-            coef = model.coef_[0]
-            corr = np.corrcoef(X.flatten(), y)[0,1]
-            
-            # Средние значения
-            avg_sales = np.mean(y)
-            avg_price = np.mean(X)
-            
-            # Эластичность
-            price_coefficient = model.coef_[0]
-            elasticity = price_coefficient * (avg_price / avg_sales)
-            
-            # Фикс: Если положительная — инвертируем для промо-логики и корректируем intercept
-            if elasticity > 0:
-                st.warning(f"**Данные показывают необычную зависимость (выше цена → больше продаж). Инвертирую для корректного промо-прогноза.**")
-                new_coef = -abs(coef)
-                new_intercept = avg_sales - new_coef * avg_price
-                model.coef_ = np.array([new_coef])
-                model.intercept_ = new_intercept
-                elasticity = new_coef * (avg_price / avg_sales)
-            else:
-                st.info("Зависимость нормальная: ниже цена → больше продаж.")
-            
-            progress_bar.progress(100)
-            
-            # Последняя цена
-            last_price = price_data[price_data['Номенклатура'] == selected_item]['Цена'].iloc[-1]
-            
-            # Session state для new_price с автоматическим сбросом при смене товара
-            if 'selected_item' not in st.session_state:
-                st.session_state.selected_item = selected_item
-                st.session_state.new_price = float(last_price)
-            if selected_item != st.session_state.selected_item:
-                st.session_state.selected_item = selected_item
-                st.session_state.new_price = float(last_price)
-            
-            # Слайдер для новой цены (value из session_state)
-            price_min, price_max = item_data['Цена_x'].min(), item_data['Цена_x'].max()
-            st.session_state.new_price = st.slider("💰 Новая цена для акции (₽):", min_value=float(price_min), max_value=float(price_max), 
-                                                   value=st.session_state.new_price, step=0.1)
-            new_price = st.session_state.new_price
-            
-            # Кнопки сценариев
-            col_btn1, col_btn2, col_btn3 = st.columns(3)
-            if col_btn1.button("🔥 Скидка 10%"):
-                st.session_state.new_price = avg_price * 0.9
-                st.rerun()
-            if col_btn2.button("💥 Скидка 20%"):
-                st.session_state.new_price = avg_price * 0.8
-                st.rerun()
-            if col_btn3.button("➡️ Текущая цена"):
-                st.session_state.new_price = last_price
-                st.rerun()
-            
-            # Прогноз на период акции (с clipping)
-            daily_raw = model.predict([[new_price]])[0]
-            daily_predictions = np.maximum(0, daily_raw)
-            total_sales = daily_predictions * DAYS_ON_SALE
-            
-            # Изменения
-            price_change_percent = -(((new_price - avg_price) / avg_price) * 100)
-            relative_price_change = (new_price - avg_price) / avg_price
-            daily_sales_change = elasticity * avg_sales * relative_price_change
-            sales_change_1_percent = -((elasticity / 100) * avg_sales)
-            
-            # 📊 Ключевые метрики
-            st.subheader("📊 Ключевые метрики")
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Прогноз на период акции (шт.)", f"{total_sales:.0f}")
-            col2.metric("Эластичность цены", f"{elasticity:.2f}")
-            col3.metric("Изменение продаж от 1% изменения цены", f"{sales_change_1_percent:.1f}")
-            
-            col4, col5, col6 = st.columns(3)
-            col4.metric("Средние продажи (день, шт.)", f"{avg_sales:.0f}")
-            col5.metric("Средняя цена (₽)", f"{avg_price:.1f}")
-            col6.metric("% изменения цены от средней цены", f"{price_change_percent:.1f}%")
-            
-            col7, col8 = st.columns(2)
-            col7.metric("Изменение среднедневных продаж(плюсом к средним), шт.", f"{daily_sales_change:.1f}")
-            col8.metric("Новая цена (₽)", f"{new_price:.1f}")
-            
-            # 📈 Линейный график сравнения (вместо бара)
-            st.subheader("📈 Сравнение сценариев")
-            comparison_df = pd.DataFrame({
-                'Сценарий': ['Текущая цена', 'Новая цена'],
-                'Прогноз продаж (шт.)': [avg_sales * DAYS_ON_SALE, total_sales]
-            })
-            fig_line = px.line(comparison_df, x='Сценарий', y='Прогноз продаж (шт.)', 
-                               title="Сравнение продаж на период акции",
-                               markers=True, color_discrete_sequence=["#FF6B6B", "#4ECDC4"])
-            fig_line.add_annotation(x=0, y=avg_sales * DAYS_ON_SALE, text=f"{avg_sales * DAYS_ON_SALE:.0f} шт.", showarrow=False)
-            fig_line.add_annotation(x=1, y=total_sales, text=f"{total_sales:.0f} шт.", showarrow=False)
-            st.plotly_chart(fig_line, use_container_width=True)
-            
-            # 📊 График зависимости
-            st.subheader("📊 Зависимость продаж от цены")
-            fig = px.scatter(x=item_data['Цена_x'], y=item_data['Кол-во продано, шт.'], 
-                             trendline="ols", title=f"Зависимость продаж от цены для {selected_item}",
-                             labels={'Цена_x': 'Цена (₽)', 'y': 'Продажи (шт.)'})
-            fig.add_vline(x=new_price, line_dash="dash", line_color="red", 
-                           annotation_text=f"Новая цена: {new_price:.1f} ₽ (прогноз день: {daily_predictions:.0f} шт.)")
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Линейный график по датам (если 'Дата' доступна)
-            if 'Дата' in item_data.reset_index().columns:
-                st.subheader("📈 Исторические продажи по датам")
-                fig_line = px.line(item_data.reset_index(), x='Дата', y='Кол-во продано, шт.', 
-                                   title=f"Продажи {selected_item} по времени")
-                st.plotly_chart(fig_line, use_container_width=True)
-            
-            # 📋 Детали прогноза
-            st.subheader("📋 Детали прогноза")
-            details_df = pd.DataFrame({
-                'Метрика': ['Прогноз на период акции', 'Эластичность цены', '% изменения цены от средней цены', 
-                           'Изменение среднедневных продаж(плюсом к средним), шт.', 'Изменение продаж от 1% изменения цены'],
-                'Значение': [f"{total_sales:.0f} шт.", f"{elasticity:.2f}", f"{price_change_percent:.1f}%", 
-                            f"{daily_sales_change:.1f} шт.", f"{sales_change_1_percent:.1f} шт."]
-            })
-            st.table(details_df)
-            
-            # Пояснения
-            st.subheader("ℹ️ Пояснения к расчётам")
-            st.markdown("""
-            - **Эластичность**: % изменения продаж на 1% изменения цены (отрицательная = скидка растит продажи).
-            - **% изменения цены**: Снижение от средней (положительное = скидка).
-            - **Изменение среднедневных продаж**: Рост/падение на день (elasticity × средние × % изменения / 100).
-            - **Изменение от 1%**: Рост на 1% снижения цены.
-            - **Прогноз**: Среднедневной (clipped ≥0) × {} дней.
-            """.format(DAYS_ON_SALE))
-            
-            # Экспорт CSV
-            if st.button("📥 Скачать отчёт как CSV"):
-                csv = details_df.to_csv(index=False).encode('utf-8')
-                st.download_button("Скачать", csv, "promo_forecast.csv", "text/csv")
-            
-            # Кнопка для сохранения Excel
-            if st.button("💾 Сохранить прогноз для всех товаров в Excel"):
-                forecast_results = []
-                for item in unique_items:
-                    item_data_full = merged_data[merged_data['Номенклатура'] == item].dropna(subset=['Цена_x', 'Кол-во продано, шт.'])
-                    if len(item_data_full) < 30:
-                        continue
-                    X_full = item_data_full[['Цена_x']].values
-                    y_full = item_data_full['Кол-во продано, шт.'].values
-                    if np.isnan(X_full).any() or np.isnan(y_full).any():
-                        continue
-                    model_f = LinearRegression()
-                    model_f.fit(X_full, y_full)
-                    avg_sales_f = np.mean(y_full)
-                    avg_price_f = np.mean(X_full)
-                    elasticity_f = model_f.coef_[0] * (avg_price_f / avg_sales_f)
-                    if elasticity_f > 0:
-                        coef_f = -abs(model_f.coef_[0])
-                        new_intercept_f = avg_sales_f - coef_f * avg_price_f
-                        model_f.coef_ = np.array([coef_f])
-                        model_f.intercept_ = new_intercept_f
-                        elasticity_f = coef_f * (avg_price_f / avg_sales_f)
-                    last_price_f = price_data[price_data['Номенклатура'] == item]['Цена'].iloc[-1]
-                    daily_raw_f = model_f.predict([[last_price_f]])[0]
-                    daily_pred_f = np.maximum(0, daily_raw_f)
-                    total_sales_f = daily_pred_f * DAYS_ON_SALE
-                    price_change_percent_f = -(((last_price_f - avg_price_f) / avg_price_f) * 100)
-                    relative_price_change_f = (last_price_f - avg_price_f) / avg_price_f
-                    daily_sales_change_f = elasticity_f * avg_sales_f * relative_price_change_f
-                    sales_change_1_percent_f = -((elasticity_f / 100) * avg_sales_f)
-                    forecast_results.append({
-                        'Код Товара': item,
-                        'Цена': last_price_f,
-                        'Прогноз на период акции': total_sales_f,
-                        'Среднедневные продажи, шт.': avg_sales_f,
-                        'Средняя цена': avg_price_f,
-                        'Коэффициент эластичности': elasticity_f,
-                        '% изменения цены от средней цены': price_change_percent_f,
-                        'Изменение среднедневных продаж(плюсом к средним), шт.': daily_sales_change_f,
-                        'Изменение продаж от 1% изменения цены': sales_change_1_percent_f
-                    })
-                
-                forecast_df = pd.DataFrame(forecast_results)
-                with pd.ExcelWriter('прогноз_продаж_на_акции.xlsx', engine='openpyxl') as writer:
-                    forecast_df.to_excel(writer, sheet_name='Прогноз', index=False)
-                st.success("Файл сохранён: прогноз_продаж_на_акции.xlsx")
-else:
-    st.info("Файл 'Продажи.xlsx' загружен автоматически. Если нужно обновить данные, добавьте файл в репозиторий и передеплойте.")
+            entry = {
+                'ds': ds, 'SKU': sku, 'price': promo_price, 'price_rel': 1,
+                'dow': ds.weekday(), 'month': ds.month, 'day': ds.day,
+                'is_weekend': int(ds.weekday() in [5,6]),
+                'SKU_le': int(np.median(le.transform(le.classes_)))
+            }
+            for l in LAGS:
+                entry[f'lag_{l}'] = 0
+            for w in ROLL_WINDOWS:
+                entry[f'roll_mean_{w}'] = 0
+
+        rows.append(entry)
+
+pred_df = pd.DataFrame(rows)
+X_pred = pred_df[FEATURES]
+
+preds = np.zeros(len(X_pred))
+for model in models:
+    preds += model.predict(X_pred, num_iteration=model.best_iteration) / len(models)
+
+pred_df['pred_qty'] = np.clip(preds, 0, None)
+
+# === 10. Сохранение результата ===
+pred_df[['ds','SKU','pred_qty']].to_excel('promo_forecast.xlsx', index=False)
+print("✅ Готово! Прогноз сохранён в 'promo_forecast.xlsx'")
